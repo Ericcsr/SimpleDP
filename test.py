@@ -6,22 +6,27 @@ import torch
 import collections
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
-from neurals import ConditionalUnet1D
-from datasets import normalize_data, unnormalize_data, PushTStateDataset
-from envs import PushTEnv
+from neurals import ConditionalUnet1D, create_vision_encoder
+from datasets import normalize_data, unnormalize_data, PushTStateDataset, PushTImageDataset
+from envs import PushTEnv, PushTImageEnv
 from tqdm.auto import tqdm
 
 from skvideo.io import vwrite
 from argparse import ArgumentParser
 
 parser = ArgumentParser()
-parser.add_argument("--config", type=str, default="default")
+parser.add_argument("--config", type=str, default="push_t_state")
 parser.add_argument("--ckpt", type=str, default="latest")
 parser.add_argument("--max_steps", type=int, default=200)
 args = parser.parse_args()
 
 config = json.load(open(f"configs/{args.config}.json"))
-obs_dim = config['obs_dim']
+if config['type'] == 'state':
+    obs_dim = config['obs_dim']
+else:
+    lowdim_obs_dim = config['lowdim_obs_dim']
+    vision_feature_dim = config['vision_feature_dim']
+    obs_dim = lowdim_obs_dim + vision_feature_dim
 action_dim = config['action_dim']
 pred_horizon = config['pred_horizon']
 obs_horizon = config['obs_horizon']
@@ -33,17 +38,35 @@ device = torch.device('cuda')
 
 noise_pred_net = ConditionalUnet1D(
     input_dim=action_dim,
-    global_cond_dim=obs_dim*obs_horizon
+    global_cond_dim=obs_dim * obs_horizon
 ).to(device)
+
+if config['type'] == 'image':
+    vision_encoder = create_vision_encoder().to(device)
+    nets = torch.nn.ModuleDict({
+        'vision_encoder': vision_encoder,
+        'noise_pred_net': noise_pred_net
+    })
+else:
+    nets = torch.nn.ModuleDict({
+        'noise_pred_net': noise_pred_net
+    })
 
 # load dataset
 # create dataset from file
-dataset = PushTStateDataset(
-    dataset_path=dataset_path,
-    pred_horizon=pred_horizon,
-    obs_horizon=obs_horizon,
-    action_horizon=action_horizon
-)
+if config['type'] == 'state':
+    dataset = PushTStateDataset(
+        dataset_path=dataset_path,
+        pred_horizon=pred_horizon,
+        obs_horizon=obs_horizon,
+        action_horizon=action_horizon
+    )
+else:
+    dataset = PushTImageDataset(
+        dataset_path=dataset_path,
+        pred_horizon=pred_horizon,
+        obs_horizon=obs_horizon,
+        action_horizon=action_horizon)
 # save training data statistics (min, max) for each dim
 stats = dataset.stats
 
@@ -60,21 +83,25 @@ noise_scheduler = DDPMScheduler(
 
 
 
-ckpt_path = f"checkpoints/{args.ckpt}.pth"
+ckpt_path = f"checkpoints/{args.ckpt}_{config['type']}.pth"
 if not os.path.isfile(ckpt_path):
     print("Please first train the model to get the checkpoint.")
     exit(-1)
 
 state_dict = torch.load(ckpt_path, map_location='cuda')
-ema_noise_pred_net = noise_pred_net
-ema_noise_pred_net.load_state_dict(state_dict)
+ema_nets = nets
+ema_nets.load_state_dict(state_dict)
+
 print('Pretrained weights loaded.')
 
 
 #@markdown ### **Inference**
 
 # limit enviornment interaction to 200 steps before termination
-env = PushTEnv()
+if config['type'] == 'state':
+    env = PushTEnv()
+else:
+    env = PushTImageEnv()
 # use a seed >200 to avoid initial states seen in the training dataset
 env.seed(100000)
 
@@ -90,20 +117,36 @@ rewards = list()
 done = False
 step_idx = 0
 
-with tqdm(total=args.max_steps, desc="Eval PushTStateEnv") as pbar:
+env_name = 'PushTStateEnv' if config['type'] == 'state' else 'PushTImageEnv'
+with tqdm(total=args.max_steps, desc=f"Eval {env_name}") as pbar:
     while not done:
         B = 1
         # stack the last obs_horizon (2) number of observations
-        obs_seq = np.stack(obs_deque)
-        # normalize observation
-        nobs = normalize_data(obs_seq, stats=stats['obs'])
-        # device transfer
-        nobs = torch.from_numpy(nobs).to(device, dtype=torch.float32)
+        if config['type'] == 'state':
+            obs_seq = np.stack(obs_deque)
+            # normalize observation
+            nstate_obs = normalize_data(obs_seq, stats=stats['state_obs'])
+            # device transfer
+            nstate_obs = torch.from_numpy(nstate_obs).to(device, dtype=torch.float32)
+        else:
+            images = np.stack([x['image'] for x in obs_deque])
+            state_obses = np.stack([x['state_obs'] for x in obs_deque])
+            # normalize observation
+            nstate_obs = normalize_data(state_obses, stats=stats['state_obs'])
+            nimages = images
+            nimages = torch.from_numpy(nimages).to(device, dtype=torch.float32)
+            nstate_obs = torch.from_numpy(nstate_obs).to(device, dtype=torch.float32)
 
         # infer action
         with torch.no_grad():
             # reshape observation to (B,obs_horizon*obs_dim)
-            obs_cond = nobs.unsqueeze(0).flatten(start_dim=1)
+            if config['type'] == 'image':
+                image_features = ema_nets['vision_encoder'](nimages)
+                obs_features = torch.cat([image_features, nstate_obs], dim=-1)
+            else:
+                obs_features = nstate_obs
+
+            obs_cond = obs_features.unsqueeze(0).flatten(start_dim=1)
 
             # initialize action from Guassian noise
             noisy_action = torch.randn(
@@ -115,7 +158,7 @@ with tqdm(total=args.max_steps, desc="Eval PushTStateEnv") as pbar:
 
             for k in noise_scheduler.timesteps:
                 # predict noise
-                noise_pred = ema_noise_pred_net(
+                noise_pred = ema_nets['noise_pred_net'](
                     sample=naction,
                     timestep=k,
                     global_cond=obs_cond

@@ -10,8 +10,8 @@ from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.training_utils import EMAModel
 from diffusers.optimization import get_scheduler
 
-from neurals import ConditionalUnet1D
-from datasets import PushTStateDataset
+from neurals import ConditionalUnet1D, create_vision_encoder
+from datasets import PushTStateDataset, PushTImageDataset
 from argparse import ArgumentParser
 
 
@@ -19,11 +19,16 @@ from argparse import ArgumentParser
 
 # download demonstration data from Google Drive
 parser = ArgumentParser()
-parser.add_argument("--config", type=str, default="default")
+parser.add_argument("--config", type=str, default="push_t_state")
 args = parser.parse_args()
 
 config = json.load(open(f"configs/{args.config}.json"))
-obs_dim = config['obs_dim']
+if config['type'] == 'state':
+    obs_dim = config['obs_dim']
+else:
+    lowdim_obs_dim = config['lowdim_obs_dim']
+    vision_feature_dim = config['vision_feature_dim']
+    obs_dim = lowdim_obs_dim + vision_feature_dim
 action_dim = config['action_dim']
 pred_horizon = config['pred_horizon']
 obs_horizon = config['obs_horizon']
@@ -40,20 +45,27 @@ if not os.path.isfile(dataset_path):
 #|p|p|p|p|p|p|p|p|p|p|p|p|p|p|p|p| actions predicted: 16
 
 # create dataset from file
-dataset = PushTStateDataset(
-    dataset_path=dataset_path,
-    pred_horizon=pred_horizon,
-    obs_horizon=obs_horizon,
-    action_horizon=action_horizon
-)
+if config['type'] == 'state':
+    dataset = PushTStateDataset(
+        dataset_path=dataset_path,
+        pred_horizon=pred_horizon,
+        obs_horizon=obs_horizon,
+        action_horizon=action_horizon
+    )
+else:
+    dataset = PushTImageDataset(
+        dataset_path=dataset_path,
+        pred_horizon=pred_horizon,
+        obs_horizon=obs_horizon,
+        action_horizon=action_horizon)
 # save training data statistics (min, max) for each dim
 stats = dataset.stats
 
 # create dataloader
 dataloader = torch.utils.data.DataLoader(
     dataset,
-    batch_size=256,
-    num_workers=1,
+    batch_size=256 if config['type'] == 'state' else 64,
+    num_workers=1 if config['type'] == 'state' else 4,
     shuffle=True,
     # accelerate cpu-gpu transfer
     pin_memory=True,
@@ -61,20 +73,19 @@ dataloader = torch.utils.data.DataLoader(
     persistent_workers=True
 )
 
-# visualize data in batch
-batch = next(iter(dataloader))
-print("batch['obs'].shape:", batch['obs'].shape)
-print("batch['action'].shape", batch['action'].shape)
-
-# observation and action dimensions corrsponding to
-# the output of PushTEnv
-
 
 # create network object
 noise_pred_net = ConditionalUnet1D(
     input_dim=action_dim,
     global_cond_dim=obs_dim*obs_horizon
 )
+
+# Create image encoder if vision
+if config['type'] == 'image':
+    vision_encoder = create_vision_encoder()
+    nets = nn.ModuleDict({"vision_encoder": vision_encoder, "noise_pred_net": noise_pred_net})
+else:
+    nets = nn.ModuleDict({"noise_pred_net": noise_pred_net})
 
 # example inputs
 noised_action = torch.randn((1, pred_horizon, action_dim))
@@ -88,11 +99,6 @@ noise = noise_pred_net(
     sample=noised_action,
     timestep=diffusion_iter,
     global_cond=obs.flatten(start_dim=1))
-
-# illustration of removing noise
-# the actual noise removal is performed by NoiseScheduler
-# and is dependent on the diffusion noise schedule
-denoised_action = noised_action - noise
 
 # for this demo, we use DDPMScheduler with 100 diffusion iterations
 num_diffusion_iters = 100
@@ -109,7 +115,7 @@ noise_scheduler = DDPMScheduler(
 
 # device transfer
 device = torch.device('cuda')
-_ = noise_pred_net.to(device)
+nets.to(device)
 
 #@markdown ### **Training**
 #@markdown
@@ -122,13 +128,13 @@ num_epochs = 100
 # accelerates training and improves stability
 # holds a copy of the model weights
 ema = EMAModel(
-    parameters=noise_pred_net.parameters(),
+    parameters=nets.parameters(),
     power=0.75)
 
 # Standard ADAM optimizer
 # Note that EMA parametesr are not optimized
 optimizer = torch.optim.AdamW(
-    params=noise_pred_net.parameters(),
+    params=nets.parameters(),
     lr=1e-4, weight_decay=1e-6)
 
 # Cosine LR schedule with linear warmup
@@ -147,15 +153,22 @@ for epoch_idx in range(num_epochs):
     for i,nbatch in enumerate(dataloader):
         # data normalized in dataset
         # device transfer
-        nobs = nbatch['obs'].to(device)
+        if config['type'] == 'state':
+            nstate_obs = nbatch['state_obs'].to(device)
+        else:
+            nimage = nbatch['image'][:,:obs_horizon].to(device)
+            nstate_obs = nbatch['state_obs'][:,:obs_horizon].to(device)
         naction = nbatch['action'].to(device)
-        B = nobs.shape[0]
+        B = nstate_obs.shape[0]
 
-        # observation as FiLM conditioning
-        # (B, obs_horizon, obs_dim)
-        obs_cond = nobs[:,:obs_horizon,:]
+        if config['type'] == 'image':
+            image_features = nets["vision_encoder"](nimage.flatten(end_dim=1))
+            image_features = image_features.reshape(*nimage.shape[:2], -1)
+            obs_features = torch.cat([image_features, nstate_obs], dim=-1)
+        else:
+            obs_features = nstate_obs[:,:obs_horizon,:]
         # (B, obs_horizon * obs_dim)
-        obs_cond = obs_cond.flatten(start_dim=1)
+        obs_cond = obs_features.flatten(start_dim=1)
 
         # sample noise to add to actions
         noise = torch.randn(naction.shape, device=device)
@@ -172,7 +185,7 @@ for epoch_idx in range(num_epochs):
             naction, noise, timesteps)
 
         # predict the noise residual
-        noise_pred = noise_pred_net(
+        noise_pred = nets['noise_pred_net'](
             noisy_actions, timesteps, global_cond=obs_cond)
 
         # L2 loss
@@ -187,7 +200,7 @@ for epoch_idx in range(num_epochs):
         lr_scheduler.step()
 
         # update Exponential Moving Average of the model weights
-        ema.step(noise_pred_net.parameters())
+        ema.step(nets.parameters())
 
         # logging
         loss_cpu = loss.item()
@@ -196,10 +209,10 @@ for epoch_idx in range(num_epochs):
 
 # Weights of the EMA model
 # is used for inference
-ema_noise_pred_net = noise_pred_net
-ema.copy_to(ema_noise_pred_net.parameters())
+ema_nets = nets
+ema.copy_to(ema_nets.parameters())
 
 # Save checkpoint
-state_dict = ema_noise_pred_net.state_dict()
-torch.save(state_dict, f"checkpoints/{time.time()}.pth")
-torch.save(state_dict, f"checkpoints/latest.pth")
+state_dict = ema_nets.state_dict()
+torch.save(state_dict, f"checkpoints/{time.time()}_{config['type']}.pth")
+torch.save(state_dict, f"checkpoints/latest_{config['type']}.pth")

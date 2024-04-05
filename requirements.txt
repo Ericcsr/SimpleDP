@@ -1,0 +1,5 @@
+numba
+torch==1.13.1
+torchvision
+tqdm
+opencv-python

@@ -1,0 +1,11 @@
+{
+    "type": "image",
+    "action_dim": 2,
+    "pred_horizon": 16,
+    "obs_horizon": 2,
+    "action_horizon": 8,
+    "vision_feature_dim":512,
+    "lowdim_obs_dim":2,
+    "num_diffusion_iters": 100,
+    "dataset_path": "data/pusht_cchi_v7_replay.zarr.zip"
+}
