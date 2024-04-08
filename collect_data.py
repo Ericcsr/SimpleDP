@@ -1,13 +1,9 @@
 import numpy as np
-import click
+from argparse import ArgumentParser
 from datasets import ReplayBuffer
 from envs import PushTEnv
 import pygame
 
-@click.command()
-@click.option('-o', '--output', required=True)
-@click.option('-rs', '--render_size', default=96, type=int)
-@click.option('-hz', '--control_hz', default=10, type=int)
 def main(output, render_size, control_hz):
     """
     Collect demonstration for the Push-T task.
@@ -114,4 +110,10 @@ def main(output, render_size, control_hz):
 
 
 if __name__ == "__main__":
-    main()
+    parser = ArgumentParser()
+    parser.add_argument('-o', '--output', required=True)
+    parser.add_argument('-rs', '--render_size', default=96, type=int)
+    parser.add_argument('-hz', '--control_hz', default=10, type=int)
+    args = parser.parse_args()
+    output = f"data/{args.output}.zarr"
+    main(output, args.render_size, args.control_hz)

@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import collections
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
 from neurals import ConditionalUnet1D, create_vision_encoder
 from datasets import normalize_data, unnormalize_data, PushTStateDataset, PushTImageDataset
@@ -31,7 +32,8 @@ action_dim = config['action_dim']
 pred_horizon = config['pred_horizon']
 obs_horizon = config['obs_horizon']
 action_horizon = config['action_horizon']
-num_diffusion_iters = config['num_diffusion_iters']
+num_diffusion_iters = config['num_diffusion_iters_train']
+num_diffusion_iters_test = config['num_diffusion_iters_test']
 dataset_path = config['dataset_path']
 
 device = torch.device('cuda')
@@ -70,16 +72,28 @@ else:
 # save training data statistics (min, max) for each dim
 stats = dataset.stats
 
-noise_scheduler = DDPMScheduler(
-    num_train_timesteps=num_diffusion_iters,
-    # the choise of beta schedule has big impact on performance
-    # we found squared cosine works the best
-    beta_schedule='squaredcos_cap_v2',
-    # clip output to [-1,1] to improve stability
-    clip_sample=True,
-    # our network predicts noise (instead of denoised action)
-    prediction_type='epsilon'
-)
+if config['scheduler'] == 'ddpm':
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=num_diffusion_iters,
+        # the choise of beta schedule has big impact on performance
+        # we found squared cosine works the best
+        beta_schedule='squaredcos_cap_v2',
+        # clip output to [-1,1] to improve stability
+        clip_sample=True,
+        # our network predicts noise (instead of denoised action)
+        prediction_type='epsilon'
+    )
+elif config["scheduler"] == 'ddim':
+    noise_scheduler = DDIMScheduler( # TODO: Change default settings.
+        num_train_timesteps=num_diffusion_iters,
+        # the choise of beta schedule has big impact on performance
+        # we found squared cosine works the best
+        beta_schedule='squaredcos_cap_v2',
+        # clip output to [-1,1] to improve stability
+        clip_sample=True,
+        # our network predicts noise (instead of denoised action)
+        prediction_type='epsilon'
+    )
 
 
 
@@ -154,7 +168,7 @@ with tqdm(total=args.max_steps, desc=f"Eval {env_name}") as pbar:
             naction = noisy_action
 
             # init scheduler
-            noise_scheduler.set_timesteps(num_diffusion_iters)
+            noise_scheduler.set_timesteps(num_diffusion_iters_test)
 
             for k in noise_scheduler.timesteps:
                 # predict noise
@@ -164,7 +178,7 @@ with tqdm(total=args.max_steps, desc=f"Eval {env_name}") as pbar:
                     global_cond=obs_cond
                 )
 
-                # inverse diffusion step (remove noise)
+                # inverse diffusion step (remove noise) # TODO: Skip steps for DDIM?
                 naction = noise_scheduler.step(
                     model_output=noise_pred,
                     timestep=k,
@@ -183,8 +197,6 @@ with tqdm(total=args.max_steps, desc=f"Eval {env_name}") as pbar:
         action = action_pred[start:end,:]
         # (action_horizon, action_dim)
 
-        # execute action_horizon number of steps
-        # without replanning
         for i in range(len(action)):
             # stepping env
             obs, reward, done, _, info = env.step(action[i])

@@ -7,6 +7,7 @@ import torch.nn as nn
 import json
 
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.training_utils import EMAModel
 from diffusers.optimization import get_scheduler
 
@@ -33,7 +34,7 @@ action_dim = config['action_dim']
 pred_horizon = config['pred_horizon']
 obs_horizon = config['obs_horizon']
 action_horizon = config['action_horizon']
-num_diffusion_iters = config['num_diffusion_iters']
+num_diffusion_iters = config['num_diffusion_iters_train']
 dataset_path = config['dataset_path']
 
 if not os.path.isfile(dataset_path):
@@ -101,17 +102,30 @@ noise = noise_pred_net(
     global_cond=obs.flatten(start_dim=1))
 
 # for this demo, we use DDPMScheduler with 100 diffusion iterations
-num_diffusion_iters = 100
-noise_scheduler = DDPMScheduler(
-    num_train_timesteps=num_diffusion_iters,
-    # the choise of beta schedule has big impact on performance
-    # we found squared cosine works the best
-    beta_schedule='squaredcos_cap_v2',
-    # clip output to [-1,1] to improve stability
-    clip_sample=True,
-    # our network predicts noise (instead of denoised action)
-    prediction_type='epsilon'
-)
+
+if config['scheduler'] == 'ddpm':
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=num_diffusion_iters,
+        # the choise of beta schedule has big impact on performance
+        # we found squared cosine works the best
+        beta_schedule='squaredcos_cap_v2',
+        # clip output to [-1,1] to improve stability
+        clip_sample=True,
+        # our network predicts noise (instead of denoised action)
+        prediction_type='epsilon'
+    )
+elif config['scheduler'] == "ddim": # TODO: parameter tuning.
+    noise_scheduler = DDIMScheduler(
+        num_train_timesteps=num_diffusion_iters,
+        # the choise of beta schedule has big impact on performance
+        # we found squared cosine works the best
+        beta_schedule='squaredcos_cap_v2',
+        # clip output to [-1,1] to improve stability
+        clip_sample=True,
+        # our network predicts noise (instead of denoised action)
+        prediction_type='epsilon'
+    )
+
 
 # device transfer
 device = torch.device('cuda')

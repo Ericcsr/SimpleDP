@@ -5,6 +5,8 @@
     "pred_horizon": 16,
     "obs_horizon": 2,
     "action_horizon": 8,
-    "num_diffusion_iters": 100,
-    "dataset_path": "data/test.zarr.zip"
+    "num_diffusion_iters_train": 50,
+    "num_diffusion_iters_test": 2,
+    "dataset_path": "data/my_push.zarr.zip",
+    "scheduler": "ddim"
 }
