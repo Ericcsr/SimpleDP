@@ -4,10 +4,11 @@
     "pred_horizon": 16,
     "obs_horizon": 2,
     "action_horizon": 8,
+    "goal_dim": 3,
     "vision_feature_dim":512,
     "lowdim_obs_dim":2,
-    "num_diffusion_iters_train": 100,
-    "num_diffusion_iters_test": 100,
-    "dataset_path": "data/pusht_cchi_v7_replay.zarr.zip",
-    "scheduler": "ddpm"
+    "num_diffusion_iters_train": 50,
+    "num_diffusion_iters_test": 50,
+    "dataset_path": "data/goal5022.zarr.zip",
+    "scheduler": "ddim"
 }

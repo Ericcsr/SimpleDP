@@ -17,6 +17,7 @@ from argparse import ArgumentParser
 
 parser = ArgumentParser()
 parser.add_argument("--config", type=str, default="push_t_state")
+parser.add_argument("--use_goal", action='store_true', default=False)
 parser.add_argument("--ckpt", type=str, default="latest")
 parser.add_argument("--max_steps", type=int, default=200)
 args = parser.parse_args()
@@ -40,7 +41,7 @@ device = torch.device('cuda')
 
 noise_pred_net = ConditionalUnet1D(
     input_dim=action_dim,
-    global_cond_dim=obs_dim * obs_horizon
+    global_cond_dim=obs_dim * obs_horizon + (config['goal_dim'] if args.use_goal else 0),
 ).to(device)
 
 if config['type'] == 'image':
@@ -61,14 +62,16 @@ if config['type'] == 'state':
         dataset_path=dataset_path,
         pred_horizon=pred_horizon,
         obs_horizon=obs_horizon,
-        action_horizon=action_horizon
+        action_horizon=action_horizon,
+        use_goal=args.use_goal
     )
 else:
     dataset = PushTImageDataset(
         dataset_path=dataset_path,
         pred_horizon=pred_horizon,
         obs_horizon=obs_horizon,
-        action_horizon=action_horizon)
+        action_horizon=action_horizon,
+        use_goal=args.use_goal)
 # save training data statistics (min, max) for each dim
 stats = dataset.stats
 
@@ -96,8 +99,10 @@ elif config["scheduler"] == 'ddim':
     )
 
 
-
-ckpt_path = f"checkpoints/{args.ckpt}_{config['type']}.pth"
+if args.use_goal:
+    ckpt_path = f"checkpoints/{args.ckpt}_{config['type']}_goal.pth"
+else:
+    ckpt_path = f"checkpoints/{args.ckpt}_{config['type']}.pth"
 if not os.path.isfile(ckpt_path):
     print("Please first train the model to get the checkpoint.")
     exit(-1)
@@ -117,7 +122,7 @@ if config['type'] == 'state':
 else:
     env = PushTImageEnv()
 # use a seed >200 to avoid initial states seen in the training dataset
-env.seed(100000)
+env.seed(5000)
 
 # get first observation
 obs, info = env.reset()
@@ -148,7 +153,7 @@ with tqdm(total=args.max_steps, desc=f"Eval {env_name}") as pbar:
             # normalize observation
             nstate_obs = normalize_data(state_obses, stats=stats['state_obs'])
             nimages = images
-            nimages = torch.from_numpy(nimages).to(device, dtype=torch.float32)
+            nimages = torch.from_numpy(nimages).float().to(device, dtype=torch.float32)
             nstate_obs = torch.from_numpy(nstate_obs).to(device, dtype=torch.float32)
 
         # infer action
@@ -161,6 +166,12 @@ with tqdm(total=args.max_steps, desc=f"Eval {env_name}") as pbar:
                 obs_features = nstate_obs
 
             obs_cond = obs_features.unsqueeze(0).flatten(start_dim=1)
+            if args.use_goal:
+                # Goal should be the same across different time steps as in same environment
+                # NOTE: Should normalize data
+                goal = torch.from_numpy(info['goal_pose']).float()
+                goal = normalize_data(goal, stats=stats['goal_pose']).to(device)
+                obs_cond = torch.cat([obs_cond, goal.unsqueeze(0)], dim=-1)
 
             # initialize action from Guassian noise
             noisy_action = torch.randn(

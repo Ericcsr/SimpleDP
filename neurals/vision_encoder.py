@@ -72,6 +72,6 @@ def replace_bn_with_gn(
 
 
 def create_vision_encoder():
-    resnet = get_resnet(name="resnet18")
+    resnet = get_resnet(name="resnet18", weights="IMAGENET1K_V1")
     resnet = replace_bn_with_gn(resnet)
     return resnet

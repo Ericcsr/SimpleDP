@@ -87,7 +87,7 @@ def main(output, render_size, control_hz):
                     'img': img,
                     'state': np.float32(state),
                     'action': np.float32(act),
-                    'n_contacts': np.float32([info['n_contacts']])
+                    'goal_pose': np.float32([info['goal_pose']])
                 }
                 episode.append(data)
                 

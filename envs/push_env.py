@@ -219,7 +219,8 @@ class PushTEnv(gym.Env):
             block_cog=None, damping=None,
             render_action=True,
             render_size=96,
-            reset_to_state=None
+            reset_to_state=None,
+            random_goal=False
         ):
         self._seed = None
         self.seed()
@@ -251,6 +252,7 @@ class PushTEnv(gym.Env):
         self.block_cog = block_cog
         self.damping = damping
         self.render_action = render_action
+        self.random_goal = random_goal
 
         """
         If human-rendering is used, `self.window` will be a reference
@@ -287,6 +289,9 @@ class PushTEnv(gym.Env):
                 rs.randn() * 2 * np.pi - np.pi
                 ])
         self._set_state(state)
+        self.goal_pose = np.array([rs.randint(100, 400),
+                                   rs.randint(100, 400),
+                                   rs.randn() * 2 * np.pi - np.pi])  # x, y, theta (in radians) initial
 
         obs = self._get_obs()
         info = self._get_info()
@@ -492,7 +497,8 @@ class PushTEnv(gym.Env):
         self.agent = self.add_circle((256, 400), 15)
         self.block = self.add_tee((256, 300), 0)
         self.goal_color = pygame.Color('LightGreen')
-        self.goal_pose = np.array([256,256,np.pi/4])  # x, y, theta (in radians)
+        # TODO: Make goal pose random.
+        self.goal_pose = np.array([256,256,np.pi/4])  # x, y, theta (in radians) initial
 
         # Add collision handeling
         self.collision_handeler = self.space.add_collision_handler(0, 0)

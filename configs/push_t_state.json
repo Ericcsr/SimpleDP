@@ -5,8 +5,9 @@
     "pred_horizon": 16,
     "obs_horizon": 2,
     "action_horizon": 8,
+    "goal_dim": 3,
     "num_diffusion_iters_train": 50,
-    "num_diffusion_iters_test": 2,
-    "dataset_path": "data/my_push.zarr.zip",
+    "num_diffusion_iters_test": 50,
+    "dataset_path": "data/goal202.zarr.zip",
     "scheduler": "ddim"
 }

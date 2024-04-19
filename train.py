@@ -21,6 +21,8 @@ from argparse import ArgumentParser
 # download demonstration data from Google Drive
 parser = ArgumentParser()
 parser.add_argument("--config", type=str, default="push_t_state")
+parser.add_argument("--use_goal", action='store_true', default=False)
+parser.add_argument("--num_epochs", type=int, default=100)
 args = parser.parse_args()
 
 config = json.load(open(f"configs/{args.config}.json"))
@@ -51,21 +53,37 @@ if config['type'] == 'state':
         dataset_path=dataset_path,
         pred_horizon=pred_horizon,
         obs_horizon=obs_horizon,
-        action_horizon=action_horizon
+        action_horizon=action_horizon,
+        use_goal=args.use_goal
     )
+    valid_dataset = PushTStateDataset(
+        dataset_path=dataset_path,
+        pred_horizon=pred_horizon,
+        obs_horizon=obs_horizon,
+        action_horizon=action_horizon,
+        use_goal=args.use_goal,
+        split="val")
 else:
     dataset = PushTImageDataset(
         dataset_path=dataset_path,
         pred_horizon=pred_horizon,
         obs_horizon=obs_horizon,
-        action_horizon=action_horizon)
+        action_horizon=action_horizon,
+        use_goal=args.use_goal)
+    valid_dataset = PushTImageDataset(
+        dataset_path=dataset_path,
+        pred_horizon=pred_horizon,
+        obs_horizon=obs_horizon,
+        action_horizon=action_horizon,
+        use_goal=args.use_goal,
+        split="val")
 # save training data statistics (min, max) for each dim
 stats = dataset.stats
 
 # create dataloader
 dataloader = torch.utils.data.DataLoader(
     dataset,
-    batch_size=256 if config['type'] == 'state' else 64,
+    batch_size=256 if config['type'] == 'state' else 64, # can be larger if more memory available
     num_workers=1 if config['type'] == 'state' else 4,
     shuffle=True,
     # accelerate cpu-gpu transfer
@@ -74,11 +92,21 @@ dataloader = torch.utils.data.DataLoader(
     persistent_workers=True
 )
 
+valid_dataloader = torch.utils.data.DataLoader(
+    valid_dataset,
+    batch_size=256 if config['type'] == 'state' else 64, # can be larger if more memory available
+    num_workers=1 if config['type'] == 'state' else 4,
+    shuffle=True,
+    # accelerate cpu-gpu transfer
+    pin_memory=True,
+    # don't kill worker process afte each epoch
+    persistent_workers=True
+)
 
 # create network object
 noise_pred_net = ConditionalUnet1D(
     input_dim=action_dim,
-    global_cond_dim=obs_dim*obs_horizon
+    global_cond_dim=obs_dim*obs_horizon + (config['goal_dim'] if args.use_goal else 0)
 )
 
 # Create image encoder if vision
@@ -87,19 +115,6 @@ if config['type'] == 'image':
     nets = nn.ModuleDict({"vision_encoder": vision_encoder, "noise_pred_net": noise_pred_net})
 else:
     nets = nn.ModuleDict({"noise_pred_net": noise_pred_net})
-
-# example inputs
-noised_action = torch.randn((1, pred_horizon, action_dim))
-obs = torch.zeros((1, obs_horizon, obs_dim))
-diffusion_iter = torch.zeros((1,))
-
-# the noise prediction network
-# takes noisy action, diffusion iteration and observation as input
-# predicts the noise added to action
-noise = noise_pred_net(
-    sample=noised_action,
-    timestep=diffusion_iter,
-    global_cond=obs.flatten(start_dim=1))
 
 # for this demo, we use DDPMScheduler with 100 diffusion iterations
 
@@ -136,7 +151,7 @@ nets.to(device)
 #@markdown Takes about an hour. If you don't want to wait, skip to the next cell
 #@markdown to load pre-trained weights
 
-num_epochs = 100
+num_epochs = args.num_epochs
 
 # Exponential Moving Average
 # accelerates training and improves stability
@@ -170,7 +185,7 @@ for epoch_idx in range(num_epochs):
         if config['type'] == 'state':
             nstate_obs = nbatch['state_obs'].to(device)
         else:
-            nimage = nbatch['image'][:,:obs_horizon].to(device)
+            nimage = nbatch['image'][:,:obs_horizon].float().to(device) # prevent bug from customized dataset
             nstate_obs = nbatch['state_obs'][:,:obs_horizon].to(device)
         naction = nbatch['action'].to(device)
         B = nstate_obs.shape[0]
@@ -183,6 +198,9 @@ for epoch_idx in range(num_epochs):
             obs_features = nstate_obs[:,:obs_horizon,:]
         # (B, obs_horizon * obs_dim)
         obs_cond = obs_features.flatten(start_dim=1)
+        if args.use_goal:
+            goal = nbatch['goal'][:,0].to(device) # Use first frame goal, should be the same across entire sequence.
+            obs_cond = torch.cat([obs_cond, goal], dim=-1)
 
         # sample noise to add to actions
         noise = torch.randn(naction.shape, device=device)
@@ -220,6 +238,57 @@ for epoch_idx in range(num_epochs):
         loss_cpu = loss.item()
         epoch_loss.append(loss_cpu)
     print("Epoch:",epoch_idx, "Loss:", np.mean(epoch_loss))
+    # TODO: validate if needed
+    if epoch_idx % 10 == 0 and epoch_idx > 0:
+        valid_loss = list()
+        with torch.no_grad():
+                for i,nbatch in enumerate(valid_dataloader):
+                    # data normalized in dataset
+                    # device transfer
+                    if config['type'] == 'state':
+                        nstate_obs = nbatch['state_obs'].to(device)
+                    else:
+                        nimage = nbatch['image'][:,:obs_horizon].float().to(device) # prevent bug from customized dataset
+                        nstate_obs = nbatch['state_obs'][:,:obs_horizon].to(device)
+                    naction = nbatch['action'].to(device)
+                    B = nstate_obs.shape[0]
+
+                    if config['type'] == 'image':
+                        image_features = nets["vision_encoder"](nimage.flatten(end_dim=1))
+                        image_features = image_features.reshape(*nimage.shape[:2], -1)
+                        obs_features = torch.cat([image_features, nstate_obs], dim=-1)
+                    else:
+                        obs_features = nstate_obs[:,:obs_horizon,:]
+                    # (B, obs_horizon * obs_dim)
+                    obs_cond = obs_features.flatten(start_dim=1)
+                    if args.use_goal:
+                        goal = nbatch['goal'][:,0].to(device) # Use first frame goal, should be the same across entire sequence.
+                        obs_cond = torch.cat([obs_cond, goal], dim=-1)
+
+                    # sample noise to add to actions
+                    noise = torch.randn(naction.shape, device=device)
+
+                    # sample a diffusion iteration for each data point
+                    timesteps = torch.randint(
+                        0, noise_scheduler.config.num_train_timesteps,
+                        (B,), device=device
+                    ).long()
+
+                    # add noise to the clean images according to the noise magnitude at each diffusion iteration
+                    # (this is the forward diffusion process)
+                    noisy_actions = noise_scheduler.add_noise(
+                        naction, noise, timesteps)
+
+                    # predict the noise residual
+                    noise_pred = nets['noise_pred_net'](
+                        noisy_actions, timesteps, global_cond=obs_cond)
+
+                    # L2 loss
+                    loss = nn.functional.mse_loss(noise_pred, noise)
+                    valid_loss.append(loss.item())
+        print("Validation Loss:", np.mean(valid_loss))
+
+        
 
 # Weights of the EMA model
 # is used for inference
@@ -228,5 +297,9 @@ ema.copy_to(ema_nets.parameters())
 
 # Save checkpoint
 state_dict = ema_nets.state_dict()
-torch.save(state_dict, f"checkpoints/{time.time()}_{config['type']}.pth")
-torch.save(state_dict, f"checkpoints/latest_{config['type']}.pth")
+if args.use_goal:
+    torch.save(state_dict, f"checkpoints/{time.time()}_{config['type']}_goal.pth")
+    torch.save(state_dict, f"checkpoints/latest_{config['type']}_goal.pth")
+else:
+    torch.save(state_dict, f"checkpoints/{time.time()}_{config['type']}.pth")
+    torch.save(state_dict, f"checkpoints/latest_{config['type']}.pth")
